@@ -4,7 +4,12 @@ import { User } from "../../models/user.model";
 import { hashPassword, comparePassword } from "../../lib/hash";
 import jwt from "jsonwebtoken";
 import { sendEmail } from "../../lib/email";
-import { generateAccessToken, generateRefreshToken } from "../../lib/token";
+import {
+  generateAccessToken,
+  generateRefreshToken,
+  verifyRefreshToken,
+} from "../../lib/token";
+import crypto from "crypto";
 
 function getAppUrl() {
   return process.env.APP_URL || `http://localhost:${process.env.PORT || 3000}`;
@@ -152,7 +157,7 @@ export async function loginHandler(req: Request, res: Response) {
     );
 
     const isSecure = process.env.NODE_ENV === "production";
-    res.cookie("jid", refreshToken, {
+    res.cookie("refreshToken", refreshToken, {
       httpOnly: true,
       secure: isSecure,
       sameSite: isSecure ? "none" : "lax",
@@ -171,6 +176,152 @@ export async function loginHandler(req: Request, res: Response) {
       },
     });
   } catch (error) {
+    console.log(error);
+    return res.status(500).json({ message: "Internal server error" });
+  }
+}
+
+export async function refreshHandler(req: Request, res: Response) {
+  try {
+    const token = req.cookies?.refreshToken as string | undefined;
+
+    if (!token) {
+      return res.status(401).json({ message: "Refresh token is missing" });
+    }
+
+    const payload = verifyRefreshToken(token);
+    const user = await User.findById(payload.sub);
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+    if (user.tokenVersion !== payload.tokenVersion) {
+      return res.status(401).json({ message: "Invalid refresh token" });
+    }
+    const newAccessToken = generateAccessToken(
+      user._id.toString(),
+      user.roles,
+      user.tokenVersion,
+    );
+
+    const newRefreshToken = generateRefreshToken(
+      user._id.toString(),
+      user.tokenVersion,
+    );
+
+    const isSecure = process.env.NODE_ENV === "production";
+    res.cookie("refreshToken", newRefreshToken, {
+      httpOnly: true,
+      secure: isSecure,
+      sameSite: isSecure ? "none" : "lax",
+      maxAge: 1000 * 60 * 60 * 24 * 7, // 7 days
+    });
+
+    return res.status(200).json({
+      message: "Token refreshed successfully",
+      accessToken: newAccessToken,
+      user: {
+        id: user._id,
+        email: user.email,
+        name: user.name,
+        roles: user.roles,
+        isEmailVerified: user.isEmailVerified,
+        twoFactorAuthEnabled: user.twoFactorAuthEnabled,
+      },
+    });
+  } catch (error) {
+    console.log(error);
+    return res.status(500).json({ message: "Internal server error" });
+  }
+}
+
+export async function logoutHandler(_req: Request, res: Response) {
+  res.clearCookie("refreshToken", { path: "/" });
+  return res.status(200).json({ message: "Logged out successfully" });
+}
+
+export async function forgotPasswordHandler(req: Request, res: Response) {
+  const { email } = req.body as { email: string };
+  if (!email) {
+    return res.status(400).json({ message: "Email is required" });
+  }
+  const normalizedEmail = email.toLowerCase().trim();
+
+  try {
+
+    const user = await User.findOne({ email: normalizedEmail });
+
+    if(!user) {
+      return res.status(404).json({ message: "If an account with this email exists, we will send you a reset link" });
+    }
+
+    const rawToken = crypto.randomBytes(32).toString("hex");
+    const hashedToken = crypto.createHash("sha256").update(rawToken).digest("hex");
+
+    user.resetPasswordToken = hashedToken;
+    user.resetPasswordTokenExpiry = new Date(Date.now() + 15*60*1000); // 15 minutes
+    await user.save();
+
+    const resetUrl = `${getAppUrl()}/api/auth/reset-password?token=${rawToken}`;
+
+    await sendEmail(
+      user.email,
+      "Reset your password",
+      `
+      <p>Hi ${user.name},</p>
+      <p>You requested a password reset. Click the link below to reset your password:</p>
+      <a href="${resetUrl}">Reset Password</a>
+      <p>This link will expire in 15 minutes.</p>
+      <p>If you did not request this, please ignore this email.</p>
+      `,
+    ).catch((error) => {
+      console.error("Failed to send password reset email:", error);
+    });
+
+    return res.status(200).json({ message: "If an account with this email exists, we will send you a reset link" });
+
+  } catch (error) {
+    console.log(error);
+    return res.status(500).json({ message: "Internal server error" });
+  }
+}
+
+
+export async function resetPasswordHandler(req: Request, res: Response) {
+  const { token, newPassword } = req.body as { token?: string; newPassword?: string };
+  
+  if(!token){
+    return res.status(400).json({ message: "Reset token is required" });
+  }
+  if(!newPassword){
+    return res.status(400).json({ message: "New password is required" });
+  }
+   
+  try{
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+
+    const user = await User.findOne({
+      resetPasswordToken: tokenHash,
+      resetPasswordTokenExpiry: { $gt: new Date() },
+    });
+
+    if (!user) {
+      return res.status(400).json({ message: "Invalid or expired reset token" });
+    }
+
+    const newPasswordHash = await hashPassword(newPassword);
+    user.passwordHash = newPasswordHash;
+
+    user.resetPasswordToken = undefined;
+    user.resetPasswordTokenExpiry = undefined;
+
+    user.tokenVersion += 1; // Invalidate existing refresh tokens
+
+    await user.save();
+
+    return res.status(200).json({ message: "Password reset successful" });
+
+  }catch(error){
     console.log(error);
     return res.status(500).json({ message: "Internal server error" });
   }
